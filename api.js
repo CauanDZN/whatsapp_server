@@ -30,7 +30,10 @@ const app = express();
 
 app.use(express.json());
 
-app.post('/send-message', upload.single('file'), (req, res) => {
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const randomDelay = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
+
+app.post('/send-message', upload.single('file'), async (req, res) => {
     const { number, message } = req.body;
     const file = req.file;
 
@@ -38,26 +41,107 @@ app.post('/send-message', upload.single('file'), (req, res) => {
         return res.status(400).json({ error: 'Número, mensagem e arquivo são necessários!' });
     }
 
+    const chatId = number + '@c.us';
+
+    const isRegistered = await client.isRegisteredUser(chatId);
+    if (!isRegistered) {
+        return res.status(400).json({ error: 'Esse número não está registrado no WhatsApp.' });
+    }
+
+    const cleanNumber = number.replace(/\D/g, '');
+
+    if (cleanNumber.length < 10 || cleanNumber.length > 15) {
+        return res.status(400).json({ error: 'Número inválido!' });
+    }
+
     const filePath = path.join('uploads', file.originalname);
     const fileName = path.basename(filePath);
     const media = new MessageMedia(file.mimetype, fs.readFileSync(filePath).toString('base64'), fileName);
 
-    client.sendMessage(number + '@c.us', message).then(() => {
-        console.log('Mensagem de texto enviada com sucesso!');
-    }).catch(err => {
-        console.error('Erro ao enviar mensagem de texto:', err);
-        return res.status(500).json({ error: 'Erro ao enviar mensagem de texto.' });
-    });
+    const trySend = async (num) => {
+        const chatId = num + '@c.us';
 
-    setTimeout(() => {
-        client.sendMessage(number + '@c.us', media).then(() => {
-            console.log('Arquivo enviado com sucesso!');
-            res.status(200).json({ success: 'Mensagem e arquivo enviados com sucesso!' });
-        }).catch(err => {
-            console.error('Erro ao enviar PDF:', err);
-            res.status(500).json({ error: 'Erro ao enviar o arquivo PDF.' });
+        try {            
+            await delay(randomDelay(10000, 30000));
+            await client.sendMessage(chatId, message);
+            console.log(`✅ Mensagem enviada para ${num}`);
+            
+            await delay(randomDelay(10000, 30000));
+            await client.sendMessage(chatId, media);
+            console.log(`✅ Arquivo enviado para ${num}`);
+
+            return true;
+        } catch (err) {
+            console.error(`Erro ao enviar para ${num}:`, err);
+            return false;
+        }
+    };
+
+    const variations = [cleanNumber];
+
+    if (cleanNumber.length === 12) {
+        const prefix = cleanNumber.slice(0, 4);
+        const rest = cleanNumber.slice(4);
+        const com9 = prefix + '9' + rest;
+        if (!variations.includes(com9)) variations.push(com9);
+    }
+
+    if (cleanNumber.length === 13) {
+        const prefix = cleanNumber.slice(0, 4);
+        const rest = cleanNumber.slice(4);
+        if (rest.charAt(0) === '9') {
+            const sem9 = prefix + rest.slice(1);
+            if (!variations.includes(sem9)) variations.push(sem9);
+        }
+    }
+
+    let textoConfirmado = false;
+    let arquivoConfirmado = false;
+
+    for (let tentativa = 1; tentativa <= 5; tentativa++) {
+        console.log(`🔁 Tentativa ${tentativa} de verificação...`);
+        try {
+            const chat = await client.getChatById(chatId);
+            const mensagensRecentes = await chat.fetchMessages({ limit: 2 });
+
+            textoConfirmado = mensagensRecentes.some(msg =>
+                msg.fromMe && msg.body === message
+            );
+
+            arquivoConfirmado = mensagensRecentes.some(msg =>
+                msg.fromMe &&
+                msg.hasMedia &&
+                msg.type === 'document'
+            );
+
+            if (textoConfirmado && arquivoConfirmado) {
+                console.log('✅ Mensagem e arquivo confirmados!');
+                break;
+            } else {
+                console.log('⏳ Ainda não confirmado. Tentando novamente...');
+            }
+        } catch (err) {
+            console.warn('⚠️ Erro ao buscar mensagens:', err.message);
+        }
+
+        await new Promise(resolve => setTimeout(resolve, 3000));
+    }
+
+    if (textoConfirmado && arquivoConfirmado) {
+        return res.status(200).json({
+            success: true,
+            message: 'Mensagem e arquivo enviados e confirmados com sucesso.'
         });
-    }, 8000);
+    } else {
+        return res.status(500).json({
+            success: false,
+            error: 'Falha ao confirmar o envio da mensagem ou do arquivo.',
+            detalhes: {
+                textoConfirmado,
+                arquivoConfirmado
+            }
+        });
+    }
 });
 
 app.post('/get-messages', async (req, res) => {
